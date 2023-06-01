@@ -3,10 +3,12 @@ package main
 import (
 	"bytes"
 	"crypto/md5"
+	"embed"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"io/ioutil"
 	"log"
 	"math"
@@ -27,8 +29,8 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-var parentPath = "./"
-var queriesPath = filepath.Join(parentPath, "poe_graphql")
+//go:embed poe_graphql/*.graphql
+var graphql embed.FS
 var queries = make(map[string]string)
 
 var logger = log.New(os.Stdout, "", log.Ldate|log.Ltime|log.Lshortfile)
@@ -49,20 +51,30 @@ func init() {
 }
 
 func loadQueries() {
-	files, err := ioutil.ReadDir(queriesPath)
+	queryFS, err := fs.Sub(graphql, "poe_graphql")
 	if err != nil {
 		panic(err)
 	}
-
-	for _, file := range files {
-		if filepath.Ext(file.Name()) != ".graphql" {
-			continue
-		}
-		queryBytes, err := ioutil.ReadFile(filepath.Join(queriesPath, file.Name()))
+	// 遍历嵌入的查询文件
+	err = fs.WalkDir(queryFS, ".", func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
-			panic(err)
+			return err
 		}
-		queries[strings.TrimSuffix(file.Name(), filepath.Ext(file.Name()))] = string(queryBytes)
+		if d.IsDir() || filepath.Ext(path) != ".graphql" {
+			return nil
+		}
+
+		queryBytes, err := fs.ReadFile(queryFS, path)
+		if err != nil {
+			return err
+		}
+
+		// 将查询文件内容存储到 queries 映射中
+		queries[strings.TrimSuffix(d.Name(), filepath.Ext(d.Name()))] = string(queryBytes)
+		return nil
+	})
+	if err != nil {
+		panic(err)
 	}
 }
 
