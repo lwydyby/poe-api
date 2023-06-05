@@ -1,4 +1,4 @@
-module poe-api
+module github.com/lwydyby/poe-api
 
 go 1.20
 
