@@ -1,4 +1,4 @@
-package main
+package poe-api
 
 import (
 	"bytes"
