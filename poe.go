@@ -1,4 +1,4 @@
-package main
+package poe_api
 
 import (
 	"bytes"
@@ -21,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	fhttp "github.com/bogdanfinn/fhttp"
@@ -78,7 +79,34 @@ func loadQueries() {
 	}
 }
 
-func generatePayload(queryName string, variables map[string]interface{}) map[string]interface{} {
+func generatePayload(queryName string, variables map[string]interface{}) interface{} {
+	if queryName == "recv" {
+		if rand.Float64() > 0.9 {
+			return []map[string]interface{}{
+				{
+					"category": "poe/bot_response_speed",
+					"data":     variables,
+				},
+				{
+					"category": "poe/statsd_event",
+					"data": map[string]interface{}{
+						"key":        "poe.speed.web_vitals.INP",
+						"value":      rand.Intn(26) + 100,
+						"category":   "time",
+						"path":       "/[handle]",
+						"extra_data": map[string]interface{}{},
+					},
+				},
+			}
+		} else {
+			return []map[string]interface{}{
+				{
+					"category": "poe/bot_response_speed",
+					"data":     variables,
+				},
+			}
+		}
+	}
 	return map[string]interface{}{
 		"query":     queries[queryName],
 		"variables": variables,
@@ -114,9 +142,11 @@ func (c *Client) requestWithRetries(method string, url string, attempts int, dat
 			return resp, nil
 		}
 		if resp.StatusCode == http.StatusTemporaryRedirect {
+			body, _ := io.ReadAll(resp.Body)
 			if strings.HasPrefix(resp.Header.Get("Location"), "/login") {
 				return nil, fmt.Errorf("invalid or missing token")
 			}
+			fmt.Println(body)
 		}
 		logger.Printf("Server returned a status code of %d while downloading %s. Retrying (%d/%d)...", resp.StatusCode, url, i+1, attempts)
 		time.Sleep(time.Second)
@@ -239,6 +269,7 @@ type Client struct {
 	wsDomain       string
 	wsConn         *websocket.Conn
 	wsConnected    bool
+	requestCount   atomic.Int64
 }
 
 func NewClient(token string, proxy *url.URL) *Client {
@@ -375,7 +406,11 @@ func (c *Client) getNextData(overwriteVars bool) map[string]interface{} {
 
 	if overwriteVars {
 		c.formKey = c.extractFormKey(string(body))
-		c.viewer = nextData["props"].(map[string]interface{})["pageProps"].(map[string]interface{})["payload"].(map[string]interface{})["viewer"].(map[string]interface{})
+		if containKey("payload", nextData["props"].(map[string]interface{})["pageProps"].(map[string]interface{})) {
+			c.viewer = nextData["props"].(map[string]interface{})["pageProps"].(map[string]interface{})["payload"].(map[string]interface{})["viewer"].(map[string]interface{})
+		} else {
+			c.viewer = nextData["props"].(map[string]interface{})["pageProps"].(map[string]interface{})["data"].(map[string]interface{})["viewer"].(map[string]interface{})
+		}
 		c.userID = c.viewer["poeUser"].(map[string]interface{})["id"].(string)
 		c.nextData = nextData
 	}
@@ -392,12 +427,17 @@ func (c *Client) getBot(displayName string) map[string]interface{} {
 	}
 
 	defer resp.Body.Close()
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 
 	var jsonData map[string]interface{}
 	err = json.Unmarshal(body, &jsonData)
 
-	chatData := jsonData["pageProps"].(map[string]interface{})["payload"].(map[string]interface{})["chatOfBotDisplayName"].(map[string]interface{})
+	var chatData map[string]interface{}
+	if containKey("payload", jsonData["pageProps"].(map[string]interface{})) {
+		chatData = jsonData["pageProps"].(map[string]interface{})["payload"].(map[string]interface{})["chatOfBotHandle"].(map[string]interface{})
+	} else {
+		chatData = jsonData["pageProps"].(map[string]interface{})["data"].(map[string]interface{})["chatOfBotHandle"].(map[string]interface{})
+	}
 	return chatData
 }
 
@@ -409,10 +449,10 @@ func (c *Client) getBots(downloadNextData bool) map[string]interface{} {
 	// 	nextData = c.nextData
 	// }
 
-	if _, ok := c.viewer["viewerBotList"]; !ok {
+	if _, ok := c.viewer["availableBotsConnection"]; !ok {
 		panic("Invalid token or no bots are available.")
 	}
-	botList := c.viewer["viewerBotList"].([]interface{})
+	botList := c.viewer["availableBotsConnection"].(map[string]interface{})["edges"].([]interface{})
 
 	var wg sync.WaitGroup
 	bots := make(map[string]interface{})
@@ -422,7 +462,7 @@ func (c *Client) getBots(downloadNextData bool) map[string]interface{} {
 		defer wg.Done()
 		lock.Lock()
 		defer lock.Unlock()
-		chatData := c.getBot(bot["displayName"].(string))
+		chatData := c.getBot(bot["node"].(map[string]interface{})["displayName"].(string))
 		bots[chatData["defaultBotObject"].(map[string]interface{})["nickname"].(string)] = chatData
 	}
 
@@ -562,7 +602,13 @@ func (c *Client) sendQuery(queryName string, variables map[string]interface{}, a
 		for k, v := range c.gqlHeaders {
 			headers[k] = v
 		}
-
+		if queryName == "recv" {
+			_, err := c.requestWithRetries(http.MethodPost, gqlRecvURL, attempts, payload, headers)
+			if err != nil {
+				panic(err)
+			}
+			return nil
+		}
 		resp, err := c.requestWithRetries(http.MethodPost, gqlURL, attempts, payload, headers)
 
 		// Handle error in HTTP response
@@ -755,13 +801,13 @@ func (c *Client) SendMessage(chatbot, message string, withChatBreak bool, timeou
 	humanMessageID := fmt.Sprintf("%v", humanMessageIDFloat64)
 	c.activeMessages[humanMessageID] = nil
 	c.messageQueues[humanMessageID] = make(chan map[string]interface{}, 1)
-
+	var lastText = ""
+	var lastChan = make(chan string, 1)
 	go func() {
 		defer delete(c.activeMessages, humanMessageID)
 		defer delete(c.messageQueues, humanMessageID)
 		defer close(result)
-
-		lastText := ""
+		defer close(lastChan)
 		messageID := ""
 
 		for {
@@ -780,13 +826,28 @@ func (c *Client) SendMessage(chatbot, message string, withChatBreak bool, timeou
 				textNew := message["text"].(string)[len(lastText):]
 				lastText = message["text"].(string)
 				messageID = fmt.Sprintf("%v", message["messageId"].(float64))
-
+				lastChan <- lastText
 				message["text_new"] = textNew
 				result <- message
 			}
 		}
 	}()
-
+	go func() {
+		for text := range lastChan {
+			c.sendQuery("recv", map[string]interface{}{
+				"bot":                                 chatbot,
+				"time_to_first_typing_indicator":      300,
+				"time_to_first_subscription_response": 600,
+				"time_to_full_bot_response":           1100,
+				"full_response_length":                len(text) + 1,
+				"full_response_word_count":            len(strings.Split(text, " ")) + 1,
+				"human_message_id":                    humanMessageID,
+				"bot_message_id":                      c.activeMessages[humanMessageID],
+				"chat_id":                             chatID,
+				"bot_response_status":                 "success",
+			}, 0)
+		}
+	}()
 	return result, nil
 }
 
@@ -905,4 +966,9 @@ func reverseSlice(s []map[string]interface{}) {
 	for i, j := 0, len(s)-1; i < j; i, j = i+1, j-1 {
 		s[i], s[j] = s[j], s[i]
 	}
+}
+
+func containKey(key string, m map[string]interface{}) bool {
+	_, ok := m[key]
+	return ok
 }
