@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"math"
 	"math/rand"
@@ -365,7 +364,7 @@ func (c *Client) getNextData(overwriteVars bool) map[string]interface{} {
 	}
 
 	defer resp.Body.Close()
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 
 	jsonRegex := regexp.MustCompile(`<script id="__NEXT_DATA__" type="application\/json">(.+?)</script>`)
 	jsonText := jsonRegex.FindStringSubmatch(string(body))[1]
@@ -523,7 +522,7 @@ func (c *Client) getChannelData() map[string]interface{} {
 	}
 
 	defer resp.Body.Close()
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 
 	var jsonData map[string]interface{}
 	err = json.Unmarshal(body, &jsonData)
