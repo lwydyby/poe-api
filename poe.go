@@ -3,20 +3,16 @@ package poe_api
 import (
 	"bytes"
 	"crypto/md5"
-	"embed"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"io/ioutil"
 	"log"
 	"math"
 	"math/rand"
 	"net/http"
 	"net/url"
-	"os"
-	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -26,91 +22,52 @@ import (
 
 	fhttp "github.com/bogdanfinn/fhttp"
 	tls_client "github.com/bogdanfinn/tls-client"
-	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
+	"github.com/zhangyunhao116/skipmap"
 )
 
-//go:embed poe_graphql/*.graphql
-var graphql embed.FS
-var queries = make(map[string]string)
-
-var logger = log.New(os.Stdout, "", log.Ldate|log.Ltime|log.Lshortfile)
-
-var userAgent = "This will be ignored! See the README for info on how to set custom headers."
-var headers = fhttp.Header{
-	"User-Agent":                []string{"Mozilla/5.0 (X11; Linux x86_64; rv:102.0) Gecko/20100101 Firefox/102.0"},
-	"Accept":                    []string{"text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"},
-	"Accept-Encoding":           []string{"gzip, deflate, br"},
-	"Accept-Language":           []string{"en-US,en;q=0.5"},
-	"Te":                        []string{"trailers"},
-	"Upgrade-Insecure-Requests": []string{"1"},
-}
-var clientIdentifier = "firefox_102"
-
-func init() {
-	loadQueries()
-}
-
-func loadQueries() {
-	queryFS, err := fs.Sub(graphql, "poe_graphql")
-	if err != nil {
-		panic(err)
-	}
-	// 遍历嵌入的查询文件
-	err = fs.WalkDir(queryFS, ".", func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if d.IsDir() || filepath.Ext(path) != ".graphql" {
-			return nil
-		}
-
-		queryBytes, err := fs.ReadFile(queryFS, path)
-		if err != nil {
-			return err
-		}
-
-		// 将查询文件内容存储到 queries 映射中
-		queries[strings.TrimSuffix(d.Name(), filepath.Ext(d.Name()))] = string(queryBytes)
-		return nil
-	})
-	if err != nil {
-		panic(err)
-	}
+type Client struct {
+	deviceID       string
+	proxy          *url.URL
+	session        tls_client.HttpClient
+	activeMessages *skipmap.StringMap[float64]
+	messageQueues  *skipmap.StringMap[chan map[string]interface{}]
+	headers        fhttp.Header
+	formKey        string
+	viewer         map[string]interface{}
+	userID         string
+	nextData       map[string]interface{}
+	channel        map[string]interface{}
+	bots           map[string]interface{}
+	botNames       map[string]string
+	gqlHeaders     http.Header
+	wsDomain       string
+	wsConn         *websocket.Conn
+	wsConnected    bool
+	requestCount   atomic.Int64
 }
 
-func generatePayload(queryName string, variables map[string]interface{}) interface{} {
-	if queryName == "recv" {
-		if rand.Float64() > 0.9 {
-			return []map[string]interface{}{
-				{
-					"category": "poe/bot_response_speed",
-					"data":     variables,
-				},
-				{
-					"category": "poe/statsd_event",
-					"data": map[string]interface{}{
-						"key":        "poe.speed.web_vitals.INP",
-						"value":      rand.Intn(26) + 100,
-						"category":   "time",
-						"path":       "/[handle]",
-						"extra_data": map[string]interface{}{},
-					},
-				},
-			}
-		} else {
-			return []map[string]interface{}{
-				{
-					"category": "poe/bot_response_speed",
-					"data":     variables,
-				},
-			}
-		}
+func NewClient(token string, proxy *url.URL) *Client {
+	// Initialize the client
+	client := &Client{
+		deviceID:       "",
+		proxy:          proxy,
+		headers:        headers,
+		activeMessages: skipmap.NewString[float64](),
+		messageQueues:  skipmap.NewString[chan map[string]interface{}](),
 	}
-	return map[string]interface{}{
-		"query":     queries[queryName],
-		"variables": variables,
-	}
+	// Set up the session
+	client.setupSession(token)
+
+	// Set up the connection
+	client.setupConnection()
+	client.connectWs()
+
+	return client
+}
+
+func (c *Client) GetBots() map[string]string {
+	return c.botNames
 }
 
 func (c *Client) requestWithRetries(method string, url string, attempts int, data []byte, headers map[string][]string) (*fhttp.Response, error) {
@@ -126,7 +83,7 @@ func (c *Client) requestWithRetries(method string, url string, attempts int, dat
 	if err != nil {
 		return nil, err
 	}
-	req.Header = c.headers
+	req.Header = c.headers.Clone()
 	if headers != nil {
 		for key, value := range headers {
 			req.Header[key] = value
@@ -153,143 +110,6 @@ func (c *Client) requestWithRetries(method string, url string, attempts int, dat
 	}
 
 	return nil, fmt.Errorf("failed to download %s too many times", url)
-}
-
-func generateNonce(length int) string {
-	if length == 0 {
-		length = 16
-	}
-	const lettersAndDigits = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-	var nonce = make([]rune, length)
-	for i := range nonce {
-		nonce[i] = rune(lettersAndDigits[rand.Intn(len(lettersAndDigits))])
-	}
-	return string(nonce)
-}
-
-func getConfigPath() string {
-	var configPath string
-	if os.PathSeparator == '\\' {
-		configPath = filepath.Join(os.Getenv("APPDATA"), "poe-api")
-	} else {
-		configPath = filepath.Join(os.Getenv("HOME"), ".config", "poe-api")
-	}
-	return configPath
-}
-
-func setSavedDeviceID(userID, deviceID string) {
-	deviceIDPath := filepath.Join(getConfigPath(), "device_id.json")
-	deviceIDs := make(map[string]string)
-
-	if _, err := os.Stat(deviceIDPath); !os.IsNotExist(err) {
-		deviceIDBytes, err := ioutil.ReadFile(deviceIDPath)
-		if err != nil {
-			panic(err)
-		}
-		err = json.Unmarshal(deviceIDBytes, &deviceIDs)
-		if err != nil {
-			panic(err)
-		}
-	}
-
-	deviceIDs[userID] = deviceID
-	err := os.MkdirAll(filepath.Dir(deviceIDPath), os.ModePerm)
-	if err != nil {
-		panic(err)
-	}
-	deviceIDBytes, err := json.MarshalIndent(deviceIDs, "", "  ")
-	if err != nil {
-		panic(err)
-	}
-	err = ioutil.WriteFile(deviceIDPath, deviceIDBytes, 0644)
-	if err != nil {
-		panic(err)
-	}
-}
-
-func getSavedDeviceID(userID string) string {
-	deviceIDPath := filepath.Join(getConfigPath(), "device_id.json")
-	deviceIDs := make(map[string]string)
-
-	if _, err := os.Stat(deviceIDPath); !os.IsNotExist(err) {
-		deviceIDBytes, err := ioutil.ReadFile(deviceIDPath)
-		if err != nil {
-			panic(err)
-		}
-		err = json.Unmarshal(deviceIDBytes, &deviceIDs)
-		if err != nil {
-			panic(err)
-		}
-	}
-
-	if deviceID, ok := deviceIDs[userID]; ok {
-		return deviceID
-	}
-
-	deviceID := uuid.New().String()
-	deviceIDs[userID] = deviceID
-	err := os.MkdirAll(filepath.Dir(deviceIDPath), os.ModePerm)
-	if err != nil {
-		panic(err)
-	}
-	deviceIDBytes, err := json.MarshalIndent(deviceIDs, "", "  ")
-	if err != nil {
-		panic(err)
-	}
-	err = ioutil.WriteFile(deviceIDPath, deviceIDBytes, 0644)
-	if err != nil {
-		panic(err)
-	}
-
-	return deviceID
-}
-
-const (
-	gqlURL      = "https://poe.com/api/gql_POST"
-	gqlRecvURL  = "https://poe.com/api/receive_POST"
-	homeURL     = "https://poe.com"
-	settingsURL = "https://poe.com/api/settings"
-)
-
-type Client struct {
-	deviceID       string
-	proxy          *url.URL
-	session        tls_client.HttpClient
-	activeMessages map[string]interface{}
-	messageQueues  map[string]chan map[string]interface{}
-	headers        fhttp.Header
-	formKey        string
-	viewer         map[string]interface{}
-	userID         string
-	nextData       map[string]interface{}
-	channel        map[string]interface{}
-	bots           map[string]interface{}
-	botNames       map[string]string
-	gqlHeaders     http.Header
-	wsDomain       string
-	wsConn         *websocket.Conn
-	wsConnected    bool
-	requestCount   atomic.Int64
-}
-
-func NewClient(token string, proxy *url.URL) *Client {
-	// Initialize the client
-	client := &Client{
-		deviceID:       "",
-		proxy:          proxy,
-		headers:        headers,
-		activeMessages: map[string]interface{}{},
-		messageQueues:  map[string]chan map[string]interface{}{},
-	}
-
-	// Set up the session
-	client.setupSession(token)
-
-	// Set up the connection
-	client.setupConnection()
-	client.connectWs()
-
-	return client
 }
 
 func (c *Client) setupSession(token string) {
@@ -358,10 +178,6 @@ func (c *Client) setupConnection() {
 	}
 
 	c.subscribe()
-}
-
-func (c *Client) GetBots() map[string]string {
-	return c.botNames
 }
 
 func (c *Client) getDeviceID() string {
@@ -442,13 +258,6 @@ func (c *Client) getBot(displayName string) map[string]interface{} {
 }
 
 func (c *Client) getBots(downloadNextData bool) map[string]interface{} {
-	// var nextData map[string]interface{}
-	// if downloadNextData {
-	// 	nextData = c.getNextData(true)
-	// } else {
-	// 	nextData = c.nextData
-	// }
-
 	if _, ok := c.viewer["availableBotsConnection"]; !ok {
 		panic("Invalid token or no bots are available.")
 	}
@@ -481,7 +290,6 @@ func (c *Client) getBotByCodename(botCodename string) map[string]interface{} {
 	if bot, ok := c.bots[botCodename]; ok {
 		return bot.(map[string]interface{})
 	}
-
 	// TODO: Cache this so it isn't re-downloaded every time
 	return c.getBot(botCodename)
 }
@@ -531,7 +339,7 @@ func (c *Client) exploreBots(endCursor *string, count int) map[string]interface{
 	}
 
 	defer resp.Body.Close()
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 
 	var jsonData map[string]interface{}
 	err = json.Unmarshal(body, &jsonData)
@@ -557,9 +365,8 @@ func (c *Client) getChannelData() map[string]interface{} {
 	log.Println("Downloading channel data...")
 	resp, err := c.requestWithRetries(http.MethodGet, settingsURL, 0, nil, nil)
 
-	// Handle error in HTTP response
 	if err != nil {
-		// ... handle error
+		panic(err)
 	}
 
 	defer resp.Body.Close()
@@ -617,7 +424,7 @@ func (c *Client) sendQuery(queryName string, variables map[string]interface{}, a
 		}
 
 		defer resp.Body.Close()
-		body, err := ioutil.ReadAll(resp.Body)
+		body, err := io.ReadAll(resp.Body)
 
 		var data map[string]interface{}
 		err = json.Unmarshal(body, &data)
@@ -736,18 +543,23 @@ func (c *Client) onMessage(msg []byte) {
 
 		message := messageData["payload"].(map[string]interface{})["data"].(map[string]interface{})["messageAdded"].(map[string]interface{})
 
-		copiedDict := make(map[string]interface{})
-		for k, v := range c.activeMessages {
-			copiedDict[k] = v
-		}
+		copiedDict := make(map[string]float64)
+		c.activeMessages.Range(func(key string, value float64) bool {
+			copiedDict[key] = value
+			return true
+		})
 
 		for key, value := range copiedDict {
-			if value == message["messageId"].(float64) && c.messageQueues[key] != nil {
-				c.messageQueues[key] <- message
+			queue, ok := c.messageQueues.Load(key)
+			if !ok {
+				continue
+			}
+			if value == message["messageId"].(float64) {
+				queue <- message
 				return
-			} else if key != "pending" && value == nil && message["state"].(string) != "complete" {
-				c.activeMessages[key] = message["messageId"].(float64)
-				c.messageQueues[key] <- message
+			} else if key != "pending" && value == 0 && message["state"].(string) != "complete" {
+				c.activeMessages.Store(key, message["messageId"].(float64))
+				queue <- message
 				return
 			}
 		}
@@ -761,17 +573,14 @@ func (c *Client) SendMessage(chatbot, message string, withChatBreak bool, timeou
 	}
 	result := make(chan map[string]interface{})
 	timer := 0 * time.Second
-	for _, v := range c.activeMessages {
-		if v == nil {
-			time.Sleep(10 * time.Millisecond)
-			timer += 10 * time.Millisecond
-			if timer > timeout {
-				return nil, errors.New("timed out waiting for other messages to send")
-			}
+	// 防止并发 这里要先检查下是否有仍然未完成的消息
+	for c.activeMessages.Len() != 0 {
+		time.Sleep(10 * time.Millisecond)
+		timer += 10 * time.Millisecond
+		if timer > timeout {
+			return nil, errors.New("timed out waiting for other messages to send")
 		}
 	}
-
-	c.activeMessages["pending"] = nil
 	log.Printf("Sending message to %s: %s", chatbot, message)
 
 	if !c.wsConnected {
@@ -790,7 +599,6 @@ func (c *Client) SendMessage(chatbot, message string, withChatBreak bool, timeou
 		"sdid":          c.deviceID,
 		"withChatBreak": withChatBreak,
 	}, 0)
-	delete(c.activeMessages, "pending")
 
 	if messageData["data"].(map[string]interface{})["messageEdgeCreate"].(map[string]interface{})["message"] == nil {
 		return nil, fmt.Errorf("daily limit reached for %s", chatbot)
@@ -799,22 +607,25 @@ func (c *Client) SendMessage(chatbot, message string, withChatBreak bool, timeou
 	humanMessage := messageData["data"].(map[string]interface{})["messageEdgeCreate"].(map[string]interface{})["message"].(map[string]interface{})
 	humanMessageIDFloat64 := humanMessage["node"].(map[string]interface{})["messageId"].(float64)
 	humanMessageID := fmt.Sprintf("%v", humanMessageIDFloat64)
-	c.activeMessages[humanMessageID] = nil
-	c.messageQueues[humanMessageID] = make(chan map[string]interface{}, 1)
+	c.activeMessages.Store(humanMessageID, 0)
+	c.messageQueues.Store(humanMessageID, make(chan map[string]interface{}, 1))
 	var lastText = ""
 	var lastChan = make(chan string, 1)
 	go func() {
-		defer delete(c.activeMessages, humanMessageID)
-		defer delete(c.messageQueues, humanMessageID)
+		defer c.activeMessages.Delete(humanMessageID)
+		defer c.messageQueues.Delete(humanMessageID)
 		defer close(result)
 		defer close(lastChan)
 		messageID := ""
-
+		ch, ok := c.messageQueues.Load(humanMessageID)
+		if !ok {
+			return
+		}
 		for {
 			select {
 			case <-time.After(timeout):
 				return
-			case message := <-c.messageQueues[humanMessageID]:
+			case message := <-ch:
 				if message["state"].(string) == "complete" {
 					if lastText != "" && fmt.Sprintf("%v", message["messageId"].(float64)) == messageID {
 						return
@@ -834,7 +645,7 @@ func (c *Client) SendMessage(chatbot, message string, withChatBreak bool, timeou
 	}()
 	go func() {
 		for text := range lastChan {
-			c.sendQuery("recv", map[string]interface{}{
+			m := map[string]interface{}{
 				"bot":                                 chatbot,
 				"time_to_first_typing_indicator":      300,
 				"time_to_first_subscription_response": 600,
@@ -842,10 +653,16 @@ func (c *Client) SendMessage(chatbot, message string, withChatBreak bool, timeou
 				"full_response_length":                len(text) + 1,
 				"full_response_word_count":            len(strings.Split(text, " ")) + 1,
 				"human_message_id":                    humanMessageID,
-				"bot_message_id":                      c.activeMessages[humanMessageID],
 				"chat_id":                             chatID,
 				"bot_response_status":                 "success",
-			}, 0)
+			}
+			id, ok := c.activeMessages.Load(humanMessageID)
+			if !ok || id == 0 {
+				m["bot_message_id"] = nil
+			} else {
+				m["bot_message_id"] = id
+			}
+			c.sendQuery("recv", m, 0)
 		}
 	}()
 	return result, nil
