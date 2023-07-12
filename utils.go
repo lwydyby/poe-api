@@ -154,3 +154,21 @@ func getSavedDeviceID(userID string) string {
 
 	return deviceID
 }
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func reverseSlice(s []map[string]interface{}) {
+	for i, j := 0, len(s)-1; i < j; i, j = i+1, j-1 {
+		s[i], s[j] = s[j], s[i]
+	}
+}
+
+func containKey(key string, m map[string]interface{}) bool {
+	_, ok := m[key]
+	return ok
+}

@@ -70,6 +70,159 @@ func (c *Client) GetBots() map[string]string {
 	return c.botNames
 }
 
+func (c *Client) SendMessage(chatbot, message string, withChatBreak bool, timeout time.Duration) (<-chan map[string]interface{}, error) {
+	// 支持通过name获取chatbot 而不需要拿到poe后端需要的name
+	if name, ok := c.botNames[chatbot]; ok {
+		chatbot = name
+	}
+	result := make(chan map[string]interface{})
+	timer := 0 * time.Second
+	// 防止并发 这里要先检查下是否有仍然未完成的消息
+	for c.activeMessages.Len() != 0 {
+		time.Sleep(10 * time.Millisecond)
+		timer += 10 * time.Millisecond
+		if timer > timeout {
+			return nil, errors.New("timed out waiting for other messages to send")
+		}
+	}
+	log.Printf("Sending message to %s: %s", chatbot, message)
+
+	if !c.wsConnected {
+		c.disconnectWs()
+		c.setupConnection()
+		c.connectWs()
+	}
+
+	chatID := c.getBotByCodename(chatbot)["chatId"].(float64)
+	messageData := c.sendQuery("SendMessageMutation", map[string]interface{}{
+		"bot":           chatbot,
+		"query":         message,
+		"chatId":        chatID,
+		"source":        nil,
+		"clientNonce":   generateNonce(16),
+		"sdid":          c.deviceID,
+		"withChatBreak": withChatBreak,
+	}, 0)
+
+	if messageData["data"].(map[string]interface{})["messageEdgeCreate"].(map[string]interface{})["message"] == nil {
+		return nil, fmt.Errorf("daily limit reached for %s", chatbot)
+	}
+
+	humanMessage := messageData["data"].(map[string]interface{})["messageEdgeCreate"].(map[string]interface{})["message"].(map[string]interface{})
+	humanMessageIDFloat64 := humanMessage["node"].(map[string]interface{})["messageId"].(float64)
+	humanMessageID := fmt.Sprintf("%v", humanMessageIDFloat64)
+	c.activeMessages.Store(humanMessageID, 0)
+	c.messageQueues.Store(humanMessageID, make(chan map[string]interface{}, 1))
+	var lastChan = make(chan string, 1)
+	go c.dealMessage(humanMessageID, lastChan, result, timeout)
+	go c.sendRecv(humanMessageID, chatbot, chatbot, lastChan)
+	return result, nil
+}
+
+func (c *Client) SendChatBreak(chatbot string) (map[string]interface{}, error) {
+	log.Printf("Sending chat break to %s", chatbot)
+	result := c.sendQuery("AddMessageBreakMutation", map[string]interface{}{
+		"chatId": c.getBotByCodename(chatbot)["chatId"],
+	}, 0)
+	return result["data"].(map[string]interface{})["messageBreakCreate"].(map[string]interface{})["message"].(map[string]interface{}), nil
+}
+
+func (c *Client) GetMessageHistory(chatbot string, count int, cursor interface{}) ([]map[string]interface{}, error) {
+	log.Printf("Downloading %d messages from %s", count, chatbot)
+
+	messages := []map[string]interface{}{}
+
+	if cursor == nil {
+		chatData := c.getBot(chatbot)
+		if len(chatData["messagesConnection"].(map[string]interface{})["edges"].([]interface{})) == 0 {
+			return []map[string]interface{}{}, nil
+		}
+
+		edges := chatData["messagesConnection"].(map[string]interface{})["edges"].([]map[string]interface{})
+		messages = edges[int(math.Max(float64(len(edges)-count), 0)):]
+		cursor = chatData["messagesConnection"].(map[string]interface{})["pageInfo"].(map[string]interface{})["startCursor"]
+		count -= len(messages)
+	}
+
+	if count <= 0 {
+		return messages, nil
+	}
+
+	if count > 50 {
+		var err error
+		messages, err = c.GetMessageHistory(chatbot, 50, cursor)
+		if err != nil {
+			return nil, err
+		}
+		for count > 0 {
+			count -= 50
+			newCursor := messages[0]["cursor"].(string)
+			newMessages, err := c.GetMessageHistory(chatbot, min(50, count), newCursor)
+			if err != nil {
+				return nil, err
+			}
+			messages = append(newMessages, messages...)
+		}
+		return messages, nil
+	}
+
+	result := c.sendQuery("ChatListPaginationQuery", map[string]interface{}{
+		"count":  count,
+		"cursor": cursor,
+		"id":     c.getBotByCodename(chatbot)["id"].(string),
+	}, 0)
+	queryMessages := result["data"].(map[string]interface{})["node"].(map[string]interface{})["messagesConnection"].(map[string]interface{})["edges"].([]map[string]interface{})
+	messages = append(queryMessages, messages...)
+	return messages, nil
+}
+
+func (c *Client) DeleteMessage(messageIDs []int) error {
+	log.Printf("Deleting messages: %v", messageIDs)
+	c.sendQuery("DeleteMessageMutation", map[string]interface{}{
+		"messageIds": messageIDs,
+	}, 0)
+	return nil
+}
+
+func (c *Client) PurgeConversation(chatbot string, count int) error {
+	log.Printf("Purging messages from %s", chatbot)
+	lastMessages, err := c.GetMessageHistory(chatbot, 50, nil)
+	if err != nil {
+		return err
+	}
+	reverseSlice(lastMessages)
+
+	for len(lastMessages) > 0 {
+		var messageIDs []int
+
+		for _, message := range lastMessages {
+			if count == 0 {
+				break
+			}
+			count--
+			messageID := int(message["node"].(map[string]interface{})["messageId"].(float64))
+			messageIDs = append(messageIDs, messageID)
+		}
+
+		err := c.DeleteMessage(messageIDs)
+		if err != nil {
+			return err
+		}
+
+		if count == 0 {
+			return nil
+		}
+		lastMessages, err = c.GetMessageHistory(chatbot, 50, nil)
+		if err != nil {
+			return err
+		}
+		reverseSlice(lastMessages)
+	}
+
+	log.Printf("No more messages left to delete.")
+	return nil
+}
+
 func (c *Client) requestWithRetries(method string, url string, attempts int, data []byte, headers map[string][]string) (*fhttp.Response, error) {
 	if attempts == 0 {
 		attempts = 10
@@ -566,226 +719,59 @@ func (c *Client) onMessage(msg []byte) {
 	}
 }
 
-func (c *Client) SendMessage(chatbot, message string, withChatBreak bool, timeout time.Duration) (<-chan map[string]interface{}, error) {
-	// 支持通过name获取chatbot 而不需要拿到poe后端需要的name
-	if name, ok := c.botNames[chatbot]; ok {
-		chatbot = name
+func (c *Client) dealMessage(humanMessageID string, textCh chan string, result chan map[string]interface{}, timeout time.Duration) {
+	defer c.activeMessages.Delete(humanMessageID)
+	defer c.messageQueues.Delete(humanMessageID)
+	defer close(result)
+	defer close(textCh)
+	lastText := ""
+	messageID := ""
+	ch, ok := c.messageQueues.Load(humanMessageID)
+	if !ok {
+		return
 	}
-	result := make(chan map[string]interface{})
-	timer := 0 * time.Second
-	// 防止并发 这里要先检查下是否有仍然未完成的消息
-	for c.activeMessages.Len() != 0 {
-		time.Sleep(10 * time.Millisecond)
-		timer += 10 * time.Millisecond
-		if timer > timeout {
-			return nil, errors.New("timed out waiting for other messages to send")
-		}
-	}
-	log.Printf("Sending message to %s: %s", chatbot, message)
-
-	if !c.wsConnected {
-		c.disconnectWs()
-		c.setupConnection()
-		c.connectWs()
-	}
-
-	chatID := c.getBotByCodename(chatbot)["chatId"].(float64)
-	messageData := c.sendQuery("SendMessageMutation", map[string]interface{}{
-		"bot":           chatbot,
-		"query":         message,
-		"chatId":        chatID,
-		"source":        nil,
-		"clientNonce":   generateNonce(16),
-		"sdid":          c.deviceID,
-		"withChatBreak": withChatBreak,
-	}, 0)
-
-	if messageData["data"].(map[string]interface{})["messageEdgeCreate"].(map[string]interface{})["message"] == nil {
-		return nil, fmt.Errorf("daily limit reached for %s", chatbot)
-	}
-
-	humanMessage := messageData["data"].(map[string]interface{})["messageEdgeCreate"].(map[string]interface{})["message"].(map[string]interface{})
-	humanMessageIDFloat64 := humanMessage["node"].(map[string]interface{})["messageId"].(float64)
-	humanMessageID := fmt.Sprintf("%v", humanMessageIDFloat64)
-	c.activeMessages.Store(humanMessageID, 0)
-	c.messageQueues.Store(humanMessageID, make(chan map[string]interface{}, 1))
-	var lastText = ""
-	var lastChan = make(chan string, 1)
-	go func() {
-		defer c.activeMessages.Delete(humanMessageID)
-		defer c.messageQueues.Delete(humanMessageID)
-		defer close(result)
-		defer close(lastChan)
-		messageID := ""
-		ch, ok := c.messageQueues.Load(humanMessageID)
-		if !ok {
+	for {
+		select {
+		case <-time.After(timeout):
 			return
-		}
-		for {
-			select {
-			case <-time.After(timeout):
-				return
-			case message := <-ch:
-				if message["state"].(string) == "complete" {
-					if lastText != "" && fmt.Sprintf("%v", message["messageId"].(float64)) == messageID {
-						return
-					} else {
-						continue
-					}
+		case message := <-ch:
+			if message["state"].(string) == "complete" {
+				if lastText != "" && fmt.Sprintf("%v", message["messageId"].(float64)) == messageID {
+					return
+				} else {
+					continue
 				}
-
-				textNew := message["text"].(string)[len(lastText):]
-				lastText = message["text"].(string)
-				messageID = fmt.Sprintf("%v", message["messageId"].(float64))
-				lastChan <- lastText
-				message["text_new"] = textNew
-				result <- message
 			}
+
+			textNew := message["text"].(string)[len(lastText):]
+			lastText = message["text"].(string)
+			messageID = fmt.Sprintf("%v", message["messageId"].(float64))
+			textCh <- lastText
+			message["text_new"] = textNew
+			result <- message
 		}
-	}()
-	go func() {
-		for text := range lastChan {
-			m := map[string]interface{}{
-				"bot":                                 chatbot,
-				"time_to_first_typing_indicator":      300,
-				"time_to_first_subscription_response": 600,
-				"time_to_full_bot_response":           1100,
-				"full_response_length":                len(text) + 1,
-				"full_response_word_count":            len(strings.Split(text, " ")) + 1,
-				"human_message_id":                    humanMessageID,
-				"chat_id":                             chatID,
-				"bot_response_status":                 "success",
-			}
-			id, ok := c.activeMessages.Load(humanMessageID)
-			if !ok || id == 0 {
-				m["bot_message_id"] = nil
-			} else {
-				m["bot_message_id"] = id
-			}
-			c.sendQuery("recv", m, 0)
-		}
-	}()
-	return result, nil
-}
-
-func (c *Client) SendChatBreak(chatbot string) (map[string]interface{}, error) {
-	log.Printf("Sending chat break to %s", chatbot)
-	result := c.sendQuery("AddMessageBreakMutation", map[string]interface{}{
-		"chatId": c.getBotByCodename(chatbot)["chatId"],
-	}, 0)
-	return result["data"].(map[string]interface{})["messageBreakCreate"].(map[string]interface{})["message"].(map[string]interface{}), nil
-}
-
-func (c *Client) GetMessageHistory(chatbot string, count int, cursor interface{}) ([]map[string]interface{}, error) {
-	log.Printf("Downloading %d messages from %s", count, chatbot)
-
-	messages := []map[string]interface{}{}
-
-	if cursor == nil {
-		chatData := c.getBot(chatbot)
-		if len(chatData["messagesConnection"].(map[string]interface{})["edges"].([]interface{})) == 0 {
-			return []map[string]interface{}{}, nil
-		}
-
-		edges := chatData["messagesConnection"].(map[string]interface{})["edges"].([]map[string]interface{})
-		messages = edges[int(math.Max(float64(len(edges)-count), 0)):]
-		cursor = chatData["messagesConnection"].(map[string]interface{})["pageInfo"].(map[string]interface{})["startCursor"]
-		count -= len(messages)
-	}
-
-	if count <= 0 {
-		return messages, nil
-	}
-
-	if count > 50 {
-		var err error
-		messages, err = c.GetMessageHistory(chatbot, 50, cursor)
-		if err != nil {
-			return nil, err
-		}
-		for count > 0 {
-			count -= 50
-			newCursor := messages[0]["cursor"].(string)
-			newMessages, err := c.GetMessageHistory(chatbot, min(50, count), newCursor)
-			if err != nil {
-				return nil, err
-			}
-			messages = append(newMessages, messages...)
-		}
-		return messages, nil
-	}
-
-	result := c.sendQuery("ChatListPaginationQuery", map[string]interface{}{
-		"count":  count,
-		"cursor": cursor,
-		"id":     c.getBotByCodename(chatbot)["id"].(string),
-	}, 0)
-	queryMessages := result["data"].(map[string]interface{})["node"].(map[string]interface{})["messagesConnection"].(map[string]interface{})["edges"].([]map[string]interface{})
-	messages = append(queryMessages, messages...)
-	return messages, nil
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-func (c *Client) DeleteMessage(messageIDs []int) error {
-	log.Printf("Deleting messages: %v", messageIDs)
-	c.sendQuery("DeleteMessageMutation", map[string]interface{}{
-		"messageIds": messageIDs,
-	}, 0)
-	return nil
-}
-
-func (c *Client) PurgeConversation(chatbot string, count int) error {
-	log.Printf("Purging messages from %s", chatbot)
-	lastMessages, err := c.GetMessageHistory(chatbot, 50, nil)
-	if err != nil {
-		return err
-	}
-	reverseSlice(lastMessages)
-
-	for len(lastMessages) > 0 {
-		var messageIDs []int
-
-		for _, message := range lastMessages {
-			if count == 0 {
-				break
-			}
-			count--
-			messageID := int(message["node"].(map[string]interface{})["messageId"].(float64))
-			messageIDs = append(messageIDs, messageID)
-		}
-
-		err := c.DeleteMessage(messageIDs)
-		if err != nil {
-			return err
-		}
-
-		if count == 0 {
-			return nil
-		}
-		lastMessages, err = c.GetMessageHistory(chatbot, 50, nil)
-		if err != nil {
-			return err
-		}
-		reverseSlice(lastMessages)
-	}
-
-	log.Printf("No more messages left to delete.")
-	return nil
-}
-
-func reverseSlice(s []map[string]interface{}) {
-	for i, j := 0, len(s)-1; i < j; i, j = i+1, j-1 {
-		s[i], s[j] = s[j], s[i]
 	}
 }
 
-func containKey(key string, m map[string]interface{}) bool {
-	_, ok := m[key]
-	return ok
+func (c *Client) sendRecv(humanMessageID, chatbot, chatID string, textCh chan string) {
+	for text := range textCh {
+		m := map[string]interface{}{
+			"bot":                                 chatbot,
+			"time_to_first_typing_indicator":      300,
+			"time_to_first_subscription_response": 600,
+			"time_to_full_bot_response":           1100,
+			"full_response_length":                len(text) + 1,
+			"full_response_word_count":            len(strings.Split(text, " ")) + 1,
+			"human_message_id":                    humanMessageID,
+			"chat_id":                             chatID,
+			"bot_response_status":                 "success",
+		}
+		id, ok := c.activeMessages.Load(humanMessageID)
+		if !ok || id == 0 {
+			m["bot_message_id"] = nil
+		} else {
+			m["bot_message_id"] = id
+		}
+		c.sendQuery("recv", m, 0)
+	}
 }
