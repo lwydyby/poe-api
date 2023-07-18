@@ -173,3 +173,7 @@ func containKey(key string, m map[string]interface{}) bool {
 	_, ok := m[key]
 	return ok
 }
+
+func getMap(m map[string]interface{}, key string) map[string]interface{} {
+	return m[key].(map[string]interface{})
+}

@@ -222,6 +222,73 @@ func (c *Client) PurgeConversation(chatbot string, count int) error {
 	return nil
 }
 
+func (c *Client) CreateBot(req CreateBot) map[string]interface{} {
+	if req.PromptPublic == nil {
+		req.PromptPublic = GetPoint[bool](true)
+	}
+	if req.MarkdownRendering == nil {
+		req.MarkdownRendering = GetPoint[bool](true)
+	}
+	result := c.sendQuery("PoeBotCreateMutation", map[string]interface{}{
+		"baseBot":              req.BaseModel,
+		"displayName":          req.DisplayName,
+		"handle":               req.Handle,
+		"prompt":               req.Prompt,
+		"isPromptPublic":       req.PromptPublic,
+		"introduction":         req.IntroMessage,
+		"description":          req.Description,
+		"profilePictureUrl":    req.PfpUrl,
+		"apiUrl":               req.ApiUrl,
+		"apiKey":               req.ApiKey,
+		"isApiBot":             req.ApiBot,
+		"hasLinkification":     req.Linkification,
+		"hasMarkdownRendering": req.MarkdownRendering,
+		"hasSuggestedReplies":  req.SuggestedReplies,
+		"isPrivateBot":         req.Private,
+		"temperature":          req.Temperature,
+	}, 0)
+	data := getMap(getMap(result, "data"), "poeBotCreate")
+	if data["status"] != "success" {
+		panic(errors.New("Poe returned an error while trying to create a bot "))
+	}
+	c.getBots(false)
+	return data
+}
+
+func (c *Client) EditBot(botID string, req CreateBot) map[string]interface{} {
+	if req.PromptPublic == nil {
+		req.PromptPublic = GetPoint[bool](true)
+	}
+	if req.MarkdownRendering == nil {
+		req.MarkdownRendering = GetPoint[bool](true)
+	}
+	result := c.sendQuery("PoeBotEditMutation", map[string]interface{}{
+		"botId":                botID,
+		"baseBot":              req.BaseModel,
+		"displayName":          req.DisplayName,
+		"handle":               req.Handle,
+		"prompt":               req.Prompt,
+		"isPromptPublic":       req.PromptPublic,
+		"introduction":         req.IntroMessage,
+		"description":          req.Description,
+		"profilePictureUrl":    req.PfpUrl,
+		"apiUrl":               req.ApiUrl,
+		"apiKey":               req.ApiKey,
+		"isApiBot":             req.ApiBot,
+		"hasLinkification":     req.Linkification,
+		"hasMarkdownRendering": req.MarkdownRendering,
+		"hasSuggestedReplies":  req.SuggestedReplies,
+		"isPrivateBot":         req.Private,
+		"temperature":          req.Temperature,
+	}, 0)
+	data := getMap(getMap(result, "data"), "poeBotEdit")
+	if data["status"] != "success" {
+		panic(errors.New("Poe returned an error while trying to create a bot "))
+	}
+	c.getBots(false)
+	return data
+}
+
 func (c *Client) requestWithRetries(method string, url string, attempts int, data []byte, headers map[string][]string) (*fhttp.Response, error) {
 	if attempts == 0 {
 		attempts = 10
