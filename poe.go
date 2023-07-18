@@ -26,6 +26,7 @@ import (
 )
 
 type Client struct {
+	token          string
 	deviceID       string
 	proxy          *url.URL
 	session        tls_client.HttpClient
@@ -49,6 +50,7 @@ type Client struct {
 func NewClient(token string, proxy *url.URL) *Client {
 	// Initialize the client
 	client := &Client{
+		token:          token,
 		deviceID:       "",
 		proxy:          proxy,
 		headers:        headers,
@@ -320,7 +322,7 @@ func (c *Client) requestWithRetries(method string, url string, attempts int, dat
 		if resp.StatusCode == http.StatusTemporaryRedirect {
 			body, _ := io.ReadAll(resp.Body)
 			if strings.HasPrefix(resp.Header.Get("Location"), "/login") {
-				return nil, fmt.Errorf("invalid or missing token")
+				return nil, &InvalidToken{token: c.token}
 			}
 			fmt.Println(body)
 		}
