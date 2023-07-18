@@ -62,6 +62,7 @@ func generatePayload(queryName string, variables map[string]interface{}) interfa
 	}
 	return map[string]interface{}{
 		"query":     queries[queryName],
+		"queryName": queryName,
 		"variables": variables,
 	}
 }
